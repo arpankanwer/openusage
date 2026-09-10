@@ -138,15 +138,22 @@ func openCodeRow(_ iso: String, _ cost: String, _ tokens: Int, _ model: String, 
 final class OpenCodeFakeSQLite: SQLiteAccessing, @unchecked Sendable {
     var data: [String: String]
     var failing: Set<String>
+    var credentials: [String: String]
     var lastDataSQL: String?
 
-    init(data: [String: String] = [:], failing: Set<String> = []) {
+    init(data: [String: String] = [:], failing: Set<String> = [], credentials: [String: String] = [:]) {
         self.data = data
         self.failing = failing
+        self.credentials = credentials
     }
 
     func queryValue(path: String, sql: String) throws -> String? {
         if failing.contains(path) { throw SQLiteError.queryFailed("boom") }
+        // OpenCode 2 credential-table lookups have their own payload bucket so the auth fallback
+        // path is testable without mixing usage rows and credential rows.
+        if sql.contains("FROM credential") {
+            return credentials[path]
+        }
         if sql.contains("json_group_array") {
             lastDataSQL = sql
             return data[path]

@@ -13,7 +13,8 @@ final class OpenCodeAuthStoreTests: XCTestCase {
         OpenCodeAuthStore(
             files: files,
             environment: FakeEnvironment(["OPENCODE_DATA_DIR": "/oc"]),
-            homeDirectory: { URL(fileURLWithPath: "/nonexistent") }
+            homeDirectory: { URL(fileURLWithPath: "/nonexistent") },
+            databasePaths: { [] }
         )
     }
 
@@ -65,6 +66,46 @@ final class OpenCodeAuthStoreTests: XCTestCase {
                 return XCTFail("expected credentialsUnreadable, got \(error)")
             }
         }
+    }
+
+    func testGoAPIKeyFallsBackToCredentialTableWhenAuthFileAbsent() throws {
+        // OpenCode 2 moved credentials out of auth.json; an absent file must still find the DB key.
+        XCTAssertEqual(try credentialStore(credentials: ["/oc/opencode.db": "sk-db-key"]).goAPIKey(), "sk-db-key")
+    }
+
+    func testGoAPIKeyPrefersAuthFileOverCredentialTable() throws {
+        // Backwards compatibility: a present auth.json wins over the OpenCode 2 credential table.
+        let files = FakeFiles(["/oc/auth.json": #"{"opencode-go":{"type":"api","key":"sk-file-key"}}"#])
+        XCTAssertEqual(
+            try credentialStore(files: files, credentials: ["/oc/opencode.db": "sk-db-key"]).goAPIKey(),
+            "sk-file-key"
+        )
+    }
+
+    func testHasCodexOAuthFallsBackToCredentialTable() throws {
+        XCTAssertTrue(
+            try credentialStore(credentials: ["/oc/opencode.db": #"{"type":"oauth","access":"a","refresh":"r"}"#])
+                .hasCodexOAuth()
+        )
+    }
+
+    func testCredentialTableAPIKeyIsNotCodexOAuth() throws {
+        XCTAssertFalse(
+            try credentialStore(credentials: ["/oc/opencode.db": #"{"type":"key","key":"sk-x"}"#]).hasCodexOAuth()
+        )
+    }
+
+    private func credentialStore(
+        files: TextFileAccessing = FakeFiles(),
+        credentials: [String: String]
+    ) -> OpenCodeAuthStore {
+        OpenCodeAuthStore(
+            files: files,
+            environment: FakeEnvironment(["OPENCODE_DATA_DIR": "/oc"]),
+            homeDirectory: { URL(fileURLWithPath: "/nonexistent") },
+            sqlite: OpenCodeFakeSQLite(credentials: credentials),
+            databasePaths: { ["/oc/opencode.db"] }
+        )
     }
 }
 

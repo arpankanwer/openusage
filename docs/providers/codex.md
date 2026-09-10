@@ -38,8 +38,9 @@ For supported GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 models, requests above 272k i
 - **"Not logged in"** — run `codex` and sign in, then refresh.
 - **API-key-only setups** can't read subscription usage — sign in with your ChatGPT account instead.
 - **Spend tiles show "No data"** — OpenUsage found no qualifying Codex usage in Codex, pi, or OpenCode logs from the last 30 days. If your Codex home lives somewhere custom, set `CODEX_HOME` so both the Codex CLI and OpenUsage look in the same place.
-- **OpenCode usage is missing** — OpenCode must currently have an `openai` OAuth credential in its
-  `auth.json`. An OpenAI API key is deliberately excluded from Codex subscription totals.
+- **OpenCode usage is missing** — OpenCode must currently have an `openai` OAuth credential, in its
+  `auth.json` or, on OpenCode 2, in its `credential` table. An OpenAI API key is deliberately excluded
+  from Codex subscription totals.
 
 ## Under the hood
 

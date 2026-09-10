@@ -77,3 +77,6 @@ line is `opencode-next.db` — so all channels are unioned). OpenCode 1 logged t
 (`type='assistant'`, `$.model.providerID`, `$.model.id`, `$.tokens.input/output/reasoning/cache.*`). The
 query unions both tables with coalesced JSON paths so either schema (or both during migration) works.
 Both `opencode-go` (Go) and `opencode` (Zen) count. Read-only.
+
+The Codex attribution scan reads the same unioned pair for its `openai` rows, so OAuth usage recorded
+after an OpenCode 2 upgrade is counted there too.

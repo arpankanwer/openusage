@@ -4,6 +4,9 @@ import Foundation
 /// as Codex's native and pi scanners. OpenCode records both ChatGPT OAuth and ordinary OpenAI API-key
 /// traffic as `providerID = openai`, so rows are eligible only while the local OpenCode credential is
 /// explicitly OAuth. This avoids charging API-key traffic to the Codex subscription card.
+///
+/// Reads both the v1 `message` and v2 `session_message` tables: OpenCode 2 moved assistant messages
+/// to the new table, so a v1-only query returns zero rows there.
 struct OpenCodeCodexUsageScanner: Sendable {
     private let authStore: OpenCodeAuthStore
     private let sqlite: SQLiteAccessing
@@ -170,30 +173,46 @@ struct OpenCodeCodexUsageScanner: Sendable {
         Int(min(max(ProviderParse.number(value) ?? 0, 0), 1_000_000_000_000_000))
     }
 
+    /// Both the v1 `message` and v2 `session_message` tables are unioned: OpenCode 2 moved assistant
+    /// messages to the new table, so a v1-only query returns zero rows there. Only `time_created`, `id`,
+    /// and `data` are unioned, so the ten-column projection below is written once and either schema (or
+    /// both during migration) decodes through the same `parseRows` shape.
     static func dataSQL(cutoffMs: Int) -> String {
         let creationCutoffMs = cutoffMs - 7 * 86_400_000
         return """
         SELECT json_group_array(json_array(
                  COALESCE(json_extract(data,'$.time.completed'),time_created),
                  json_extract(data,'$.cost'),
-                 COALESCE(json_extract(data,'$.tokens.total'),0),
-                 json_extract(data,'$.modelID'),
+                 COALESCE(json_extract(data,'$.tokens.total'), COALESCE(json_extract(data,'$.tokens.input'),0)+COALESCE(json_extract(data,'$.tokens.cache.read'),0)+COALESCE(json_extract(data,'$.tokens.cache.write'),0)+COALESCE(json_extract(data,'$.tokens.output'),0)+COALESCE(json_extract(data,'$.tokens.reasoning'),0)),
+                 COALESCE(json_extract(data,'$.model.id'), json_extract(data,'$.modelID')),
                  COALESCE(json_extract(data,'$.tokens.input'),0),
                  COALESCE(json_extract(data,'$.tokens.cache.read'),0),
                  COALESCE(json_extract(data,'$.tokens.cache.write'),0),
                  COALESCE(json_extract(data,'$.tokens.output'),0),
                  COALESCE(json_extract(data,'$.tokens.reasoning'),0),
                  id))
-        FROM message
-        WHERE time_created >= \(creationCutoffMs)
-          AND json_valid(data)
-          AND COALESCE(json_extract(data,'$.time.completed'),time_created) >= \(cutoffMs)
-          AND json_extract(data,'$.role') = 'assistant'
-          AND json_extract(data,'$.providerID') = 'openai'
-          AND json_type(data,'$.cost') IN ('integer','real')
-          AND json_extract(data,'$.cost') = 0
-          AND (json_type(data,'$.time.completed') IN ('integer','real')
-               OR json_type(data,'$.finish') = 'text');
+        FROM (
+          SELECT time_created, id, data FROM message
+          WHERE time_created >= \(creationCutoffMs)
+            AND json_valid(data)
+            AND json_extract(data,'$.role') = 'assistant'
+            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'
+            AND json_type(data,'$.cost') IN ('integer','real')
+            AND json_extract(data,'$.cost') = 0
+            AND (json_type(data,'$.time.completed') IN ('integer','real')
+                 OR json_type(data,'$.finish') = 'text')
+          UNION ALL
+          SELECT time_created, id, data FROM session_message
+          WHERE time_created >= \(creationCutoffMs)
+            AND type = 'assistant'
+            AND json_valid(data)
+            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'
+            AND json_type(data,'$.cost') IN ('integer','real')
+            AND json_extract(data,'$.cost') = 0
+            AND (json_type(data,'$.time.completed') IN ('integer','real')
+                 OR json_type(data,'$.finish') = 'text')
+        )
+        WHERE COALESCE(json_extract(data,'$.time.completed'),time_created) >= \(cutoffMs);
         """
     }
 }

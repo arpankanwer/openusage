@@ -195,11 +195,25 @@ final class OpenCodeCodexUsageScannerTests: XCTestCase {
 
     func testQuerySelectsOnlyCompletedOpenAIRows() {
         let sql = OpenCodeCodexUsageScanner.dataSQL(cutoffMs: 123)
-        XCTAssertTrue(sql.contains("providerID') = 'openai'"), sql)
+        // The provider path is coalesced rather than a bare `$.providerID` because OpenCode 2 moved it
+        // under `$.model`.
+        XCTAssertTrue(
+            sql.contains("COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'"),
+            sql
+        )
         XCTAssertTrue(sql.contains("$.cost') = 0"), sql)
         XCTAssertTrue(sql.contains("$.time.completed"), sql)
         XCTAssertTrue(sql.contains("$.finish"), sql)
         XCTAssertTrue(sql.contains("$.tokens.reasoning"), sql)
+    }
+
+    func testQueryCoversV2SessionMessageSchema() {
+        // OpenCode 2 moved assistant messages to `session_message` with namespaced model paths;
+        // a v1-only query returns zero rows there.
+        let sql = OpenCodeCodexUsageScanner.dataSQL(cutoffMs: 123)
+        XCTAssertTrue(sql.contains("session_message"), sql)
+        XCTAssertTrue(sql.contains("type = 'assistant'"), sql)
+        XCTAssertTrue(sql.contains("$.model.providerID"), sql)
     }
 
     private func row(
