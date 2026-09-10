@@ -53,7 +53,10 @@ struct OpenCodeCodexUsageScanner: Sendable {
         var failures: [String: String] = [:]
         for path in paths {
             do {
-                if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs)) {
+                // A database with no message tables has nothing to contribute; skip it rather than let
+                // the query fail and drop every other database's rows.
+                guard let tables = try Self.messageTables(in: path, sqlite: sqlite) else { continue }
+                if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs, tables: tables)) {
                     rows.append(contentsOf: Self.parseRows(json))
                 }
             } catch {
@@ -103,8 +106,15 @@ struct OpenCodeCodexUsageScanner: Sendable {
         return accumulator.build()
     }
 
-    struct Row: Sendable, Equatable {
-        var id: String?
+    /// The message tables a database actually holds, or `nil` when it holds neither. Statement
+    /// preparation fails on a missing table, so the query is built from this answer, not an assumption.
+    private static func messageTables(in path: String, sqlite: SQLiteAccessing) throws -> OpenCodeMessageTables? {
+        let output = try sqlite.queryValue(path: path, sql: OpenCodePaths.messageTablesSQL) ?? ""
+        let tables = OpenCodePaths.messageTables(fromProbeOutput: output)
+        return tables.isEmpty ? nil : tables
+    }
+
+    struct Row: Sendable, Equatable {        var id: String?
         var timestamp: Date
         var model: String
         var tokens: TokenBreakdown
@@ -173,13 +183,9 @@ struct OpenCodeCodexUsageScanner: Sendable {
         Int(min(max(ProviderParse.number(value) ?? 0, 0), 1_000_000_000_000_000))
     }
 
-    /// Both the v1 `message` and v2 `session_message` tables are unioned: OpenCode 2 moved assistant
-    /// messages to the new table, so a v1-only query returns zero rows there. Only `time_created`, `id`,
-    /// and `data` are unioned, so the ten-column projection below is written once and either schema (or
-    /// both during migration) decodes through the same `parseRows` shape.
-    static func dataSQL(cutoffMs: Int) -> String {
-        let creationCutoffMs = cutoffMs - 7 * 86_400_000
-        return """
+    /// Ten columns in `parseRows` order, written once so the table combinations can't drift. Only
+    /// `time_created`, `id`, and `data` are unioned; the projection sits outside.
+    private static let dataProjection = """
         SELECT json_group_array(json_array(
                  COALESCE(json_extract(data,'$.time.completed'),time_created),
                  json_extract(data,'$.cost'),
@@ -191,28 +197,65 @@ struct OpenCodeCodexUsageScanner: Sendable {
                  COALESCE(json_extract(data,'$.tokens.output'),0),
                  COALESCE(json_extract(data,'$.tokens.reasoning'),0),
                  id))
-        FROM (
-          SELECT time_created, id, data FROM message
-          WHERE time_created >= \(creationCutoffMs)
-            AND json_valid(data)
-            AND json_extract(data,'$.role') = 'assistant'
-            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'
-            AND json_type(data,'$.cost') IN ('integer','real')
-            AND json_extract(data,'$.cost') = 0
-            AND (json_type(data,'$.time.completed') IN ('integer','real')
-                 OR json_type(data,'$.finish') = 'text')
-          UNION ALL
-          SELECT time_created, id, data FROM session_message
-          WHERE time_created >= \(creationCutoffMs)
-            AND type = 'assistant'
-            AND json_valid(data)
-            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'
-            AND json_type(data,'$.cost') IN ('integer','real')
-            AND json_extract(data,'$.cost') = 0
-            AND (json_type(data,'$.time.completed') IN ('integer','real')
-                 OR json_type(data,'$.finish') = 'text')
-        )
-        WHERE COALESCE(json_extract(data,'$.time.completed'),time_created) >= \(cutoffMs);
+        FROM
         """
+
+    /// OpenCode recorded OAuth Codex traffic as `providerID = 'openai'` on the v1 table and
+    /// `$.model.providerID` on the v2 one, and moved the role from `$.role` into the `type` column.
+    /// Both branches keep the zero-cost filter: the built-in Codex OAuth plugin writes every model rate
+    /// as zero, so a positive cost is API-key traffic that must stay off the Codex card.
+    private static func v1Rows(cutoffMs: Int, creationCutoffMs: Int) -> String {
+        """
+        SELECT time_created, id, data FROM message
+        WHERE time_created >= \(creationCutoffMs)
+          AND json_valid(data)
+          AND json_extract(data,'$.role') = 'assistant'
+          AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'
+          AND json_type(data,'$.cost') IN ('integer','real')
+          AND json_extract(data,'$.cost') = 0
+          AND (json_type(data,'$.time.completed') IN ('integer','real')
+               OR json_type(data,'$.finish') = 'text')
+        """
+    }
+
+    private static func v2Rows(cutoffMs: Int, creationCutoffMs: Int) -> String {
+        """
+        SELECT time_created, id, data FROM session_message
+        WHERE time_created >= \(creationCutoffMs)
+          AND type = 'assistant'
+          AND json_valid(data)
+          AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'
+          AND json_type(data,'$.cost') IN ('integer','real')
+          AND json_extract(data,'$.cost') = 0
+          AND (json_type(data,'$.time.completed') IN ('integer','real')
+               OR json_type(data,'$.finish') = 'text')
+        """
+    }
+
+    /// One table or two, the body is always a subquery so the projection above can read `FROM` it
+    /// uniformly. Callers never pass an empty set — a database with no message tables is skipped
+    /// before any SQL is built.
+    private static func rowsSource(_ tables: OpenCodeMessageTables, v1: String, v2: String) -> String {
+        let bodies = [
+            tables.contains(.v1) ? v1 : nil,
+            tables.contains(.v2) ? v2 : nil,
+        ].compactMap { $0 }
+        return "(\n" + bodies.map(indented).joined(separator: "\n          UNION ALL\n") + "\n        )"
+    }
+
+    private static func indented(_ body: String) -> String {
+        body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "  " + $0 }
+            .joined(separator: "\n")
+    }
+
+    static func dataSQL(cutoffMs: Int, tables: OpenCodeMessageTables = .all) -> String {
+        let creationCutoffMs = cutoffMs - 7 * 86_400_000
+        let source = rowsSource(
+            tables,
+            v1: v1Rows(cutoffMs: cutoffMs, creationCutoffMs: creationCutoffMs),
+            v2: v2Rows(cutoffMs: cutoffMs, creationCutoffMs: creationCutoffMs)
+        )
+        return "\(dataProjection)\n\(source)\nWHERE COALESCE(json_extract(data,'$.time.completed'),time_created) >= \(cutoffMs);"
     }
 }

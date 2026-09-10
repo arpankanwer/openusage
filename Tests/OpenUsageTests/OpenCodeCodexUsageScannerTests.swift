@@ -216,6 +216,38 @@ final class OpenCodeCodexUsageScannerTests: XCTestCase {
         XCTAssertTrue(sql.contains("$.model.providerID"), sql)
     }
 
+    func testV2OnlyDatabaseScansWithoutNamingTheMissingTable() async throws {
+        let rows = "[" + row(
+            "2026-07-12T10:00:00.000Z", cost: "0", total: 150, model: "gpt-test",
+            input: 100, cacheRead: 20, output: 20, reasoning: 10
+        ) + "]"
+        let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": rows], tables: ["/oc/opencode.db": "0|1"])
+        let scanner = OpenCodeCodexUsageScanner(
+            authStore: OpenCodeAuthStore(
+                files: FakeFiles(["/oc/auth.json": #"{"openai":{"type":"oauth","access":"token"}}"#]),
+                environment: FakeEnvironment(["OPENCODE_DATA_DIR": "/oc"]),
+                homeDirectory: { URL(fileURLWithPath: "/unused") }
+            ),
+            sqlite: sqlite,
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+
+        let scan = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(try XCTUnwrap(scan?.series.daily.first).totalTokens, 150)
+        XCTAssertTrue(try XCTUnwrap(sqlite.lastDataSQL).contains("session_message"))
+        XCTAssertFalse(try XCTUnwrap(sqlite.lastDataSQL).contains("FROM message"))
+    }
+
+    func testVariantSQLSelectsOnlyTheTablesItWasGiven() {
+        let v1 = OpenCodeCodexUsageScanner.dataSQL(cutoffMs: 123, tables: .v1)
+        XCTAssertTrue(v1.contains("FROM message"), v1)
+        XCTAssertFalse(v1.contains("session_message"), v1)
+
+        let v2 = OpenCodeCodexUsageScanner.dataSQL(cutoffMs: 123, tables: .v2)
+        XCTAssertTrue(v2.contains("FROM session_message"), v2)
+        XCTAssertFalse(v2.contains("FROM message"), v2)
+    }
+
     private func row(
         _ iso: String,
         cost: String,

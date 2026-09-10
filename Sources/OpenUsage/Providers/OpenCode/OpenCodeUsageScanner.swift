@@ -75,7 +75,10 @@ struct OpenCodeUsageScanner: Sendable {
         for path in paths {
             checked.insert(path)
             do {
-                if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs)) {
+                // A database with no message tables has no usage to read; skip it instead of letting
+                // the query fail and paint the whole provider as unreadable.
+                guard let tables = try messageTables(in: path) else { continue }
+                if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs, tables: tables)) {
                     rows.append(contentsOf: Self.parseRows(json))
                 }
             } catch {
@@ -119,7 +122,8 @@ struct OpenCodeUsageScanner: Sendable {
         }
         for path in paths {
             do {
-                if let value = try sqlite.queryValue(path: path, sql: Self.probeSQL), !value.isEmpty {
+                guard let tables = try messageTables(in: path) else { continue }
+                if let value = try sqlite.queryValue(path: path, sql: Self.probeSQL(tables: tables)), !value.isEmpty {
                     return true
                 }
             } catch {
@@ -127,6 +131,15 @@ struct OpenCodeUsageScanner: Sendable {
             }
         }
         return false
+    }
+
+    /// The message tables a database actually holds, or `nil` when it holds neither — a database the
+    /// scanners can't read usage from. Statement preparation fails on a missing table, so every query
+    /// is built from this answer rather than assuming a schema.
+    private func messageTables(in path: String) throws -> OpenCodeMessageTables? {
+        let output = try sqlite.queryValue(path: path, sql: OpenCodePaths.messageTablesSQL) ?? ""
+        let tables = OpenCodePaths.messageTables(fromProbeOutput: output)
+        return tables.isEmpty ? nil : tables
     }
 
     // MARK: - Parsing
@@ -168,45 +181,81 @@ struct OpenCodeUsageScanner: Sendable {
     /// SQL literal built from `hostedProviderIDs`, so the tracked list has one source of truth.
     private static let providerFilter = "(" + hostedProviderIDs.map { "'\($0)'" }.joined(separator: ",") + ")"
 
-    static func dataSQL(cutoffMs: Int) -> String {
-        """
+    static func dataSQL(cutoffMs: Int, tables: OpenCodeMessageTables = .all) -> String {
+        let source = rowsSource(tables, v1: v1Rows(cutoffMs: cutoffMs), v2: v2Rows(cutoffMs: cutoffMs))
+        return "\(dataProjection)\n\(source);"
+    }
+
+    static func probeSQL(tables: OpenCodeMessageTables = .all) -> String {
+        let source = rowsSource(tables, v1: v1Probe, v2: v2Probe)
+        return "SELECT 1 FROM\n\(source)\nLIMIT 1;"
+    }
+
+    /// The row shape every variant returns, written once so the three table combinations can't drift.
+    private static let dataProjection = """
         SELECT json_group_array(json_array(
                  time_created,
                  json_extract(data,'$.cost'),
                  COALESCE(json_extract(data,'$.tokens.total'), COALESCE(json_extract(data,'$.tokens.input'),0)+COALESCE(json_extract(data,'$.tokens.output'),0)+COALESCE(json_extract(data,'$.tokens.reasoning'),0)+COALESCE(json_extract(data,'$.tokens.cache.read'),0)+COALESCE(json_extract(data,'$.tokens.cache.write'),0)),
                  COALESCE(json_extract(data,'$.model.id'), json_extract(data,'$.modelID')),
                  COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID'))))
-        FROM (
-          SELECT time_created, data FROM message
-          WHERE time_created >= \(cutoffMs)
-            AND json_valid(data)
-            AND json_extract(data,'$.role') = 'assistant'
-            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
-            AND json_type(data,'$.cost') IN ('integer','real')
-          UNION ALL
-          SELECT time_created, data FROM session_message
-          WHERE time_created >= \(cutoffMs)
-            AND type = 'assistant'
-            AND json_valid(data)
-            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
-            AND json_type(data,'$.cost') IN ('integer','real')
-        );
+        FROM
+        """
+
+    /// One table or two, the body is always a subquery so the projection above can read `FROM` it
+    /// uniformly. Callers never pass an empty set — a database with no message tables is skipped
+    /// before any SQL is built.
+    private static func rowsSource(_ tables: OpenCodeMessageTables, v1: String, v2: String) -> String {
+        let bodies = [
+            tables.contains(.v1) ? v1 : nil,
+            tables.contains(.v2) ? v2 : nil,
+        ].compactMap { $0 }
+        return "(\n" + bodies.map(indented).joined(separator: "\n          UNION ALL\n") + "\n        )"
+    }
+
+    private static func indented(_ body: String) -> String {
+        body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "  " + $0 }
+            .joined(separator: "\n")
+    }
+
+    /// `message` names the role and provider flatly; `session_message` moved the role into its `type`
+    /// column and namespaced the model under `$.model`, so each branch is filtered for its own schema.
+    private static func v1Rows(cutoffMs: Int) -> String {
+        """
+        SELECT time_created, data FROM message
+        WHERE time_created >= \(cutoffMs)
+          AND json_valid(data)
+          AND json_extract(data,'$.role') = 'assistant'
+          AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
+          AND json_type(data,'$.cost') IN ('integer','real')
         """
     }
 
-    static let probeSQL = """
-        SELECT 1 FROM (
-          SELECT 1 as x FROM message
-          WHERE json_valid(data)
-            AND json_extract(data,'$.role') = 'assistant'
-            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
-            AND json_type(data,'$.cost') IN ('integer','real')
-          UNION ALL
-          SELECT 1 FROM session_message
-          WHERE type = 'assistant'
-            AND json_valid(data)
-            AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
-            AND json_type(data,'$.cost') IN ('integer','real')
-        ) LIMIT 1;
+    private static func v2Rows(cutoffMs: Int) -> String {
+        """
+        SELECT time_created, data FROM session_message
+        WHERE time_created >= \(cutoffMs)
+          AND type = 'assistant'
+          AND json_valid(data)
+          AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
+          AND json_type(data,'$.cost') IN ('integer','real')
+        """
+    }
+
+    private static let v1Probe = """
+        SELECT 1 FROM message
+        WHERE json_valid(data)
+          AND json_extract(data,'$.role') = 'assistant'
+          AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
+          AND json_type(data,'$.cost') IN ('integer','real')
+        """
+
+    private static let v2Probe = """
+        SELECT 1 FROM session_message
+        WHERE type = 'assistant'
+          AND json_valid(data)
+          AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
+          AND json_type(data,'$.cost') IN ('integer','real')
         """
 }

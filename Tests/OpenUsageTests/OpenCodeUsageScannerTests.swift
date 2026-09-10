@@ -124,6 +124,67 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         let tokens = scan.logScan.series.daily.reduce(0) { $0 + $1.totalTokens }
         XCTAssertEqual(tokens, 1_000_000_000_000_000)
     }
+
+    // MARK: - Schema probe
+
+    func testMessageTablesParsing() {
+        XCTAssertEqual(OpenCodePaths.messageTables(fromProbeOutput: "1|1"), .all)
+        XCTAssertEqual(OpenCodePaths.messageTables(fromProbeOutput: "0|1"), .v2)
+        XCTAssertEqual(OpenCodePaths.messageTables(fromProbeOutput: "1|0"), .v1)
+        XCTAssertEqual(OpenCodePaths.messageTables(fromProbeOutput: "0|0"), [])
+        // Malformed output reads as "no tables" so the caller skips the file rather than querying it.
+        XCTAssertEqual(OpenCodePaths.messageTables(fromProbeOutput: "1|1\n"), .all)
+        XCTAssertEqual(OpenCodePaths.messageTables(fromProbeOutput: ""), [])
+        XCTAssertEqual(OpenCodePaths.messageTables(fromProbeOutput: "not a probe result"), [])
+    }
+
+    func testV2OnlyDatabaseScansWithoutNamingTheMissingTable() async throws {
+        // A database written by an early 1.18.x build can hold only `session_message`. Naming the
+        // absent `message` table would fail preparation and report the provider as unreadable.
+        let db = "[" + openCodeRow("2026-07-12T11:00:00.000Z", "2.0", 1000, "deepseek-v4-pro", "opencode-go") + "]"
+        let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": db], tables: ["/oc/opencode.db": "0|1"])
+        let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] })
+
+        guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
+        XCTAssertEqual(scan.logScan.series.daily.compactMap(\.costUSD).reduce(0, +), 2.0, accuracy: 0.0001)
+        let sql = try XCTUnwrap(sqlite.lastDataSQL)
+        XCTAssertTrue(sql.contains("session_message"), sql)
+        XCTAssertFalse(sql.contains("FROM message"), sql)
+        XCTAssertFalse(sql.contains("UNION ALL"), sql)
+    }
+
+    func testV1OnlyDatabaseScansWithoutNamingTheMissingTable() async throws {
+        let db = "[" + openCodeRow("2026-07-12T11:00:00.000Z", "3.0", 500, "glm-5.2", "opencode") + "]"
+        let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": db], tables: ["/oc/opencode.db": "1|0"])
+        let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] })
+
+        guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
+        XCTAssertEqual(scan.logScan.series.daily.compactMap(\.costUSD).reduce(0, +), 3.0, accuracy: 0.0001)
+        let sql = try XCTUnwrap(sqlite.lastDataSQL)
+        XCTAssertTrue(sql.contains("FROM message"), sql)
+        XCTAssertFalse(sql.contains("session_message"), sql)
+    }
+
+    func testDatabaseWithNoMessageTablesIsSkippedNotFatal() async throws {
+        // A sibling path still has data, so the empty one must not fail the whole refresh.
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(
+                data: ["/oc/opencode-next.db": db2],
+                tables: ["/oc/opencode.db": "0|0", "/oc/opencode-next.db": "1|1"]
+            ),
+            databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
+        )
+        guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
+        XCTAssertEqual(scan.logScan.series.daily.compactMap(\.costUSD).reduce(0, +), 4.0, accuracy: 0.0001)
+    }
+
+    func testHasHostedUsageSkipsDatabasesWithoutMessageTables() {
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[]"], tables: ["/oc/opencode.db": "0|0"]),
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+        XCTAssertFalse(scanner.hasHostedUsage())
+    }
 }
 
 /// One `[time_created, cost, tokens, model, provider]` row in the `json_group_array` shape both
@@ -139,16 +200,29 @@ final class OpenCodeFakeSQLite: SQLiteAccessing, @unchecked Sendable {
     var data: [String: String]
     var failing: Set<String>
     var credentials: [String: String]
+    /// `v1|v2` counts for the `sqlite_master` probe. Absent paths read as `1|1` so suites that don't
+    /// care about the schema keep exercising the union they were written against.
+    var tables: [String: String]
     var lastDataSQL: String?
 
-    init(data: [String: String] = [:], failing: Set<String> = [], credentials: [String: String] = [:]) {
+    init(
+        data: [String: String] = [:],
+        failing: Set<String> = [],
+        credentials: [String: String] = [:],
+        tables: [String: String] = [:]
+    ) {
         self.data = data
         self.failing = failing
         self.credentials = credentials
+        self.tables = tables
     }
 
     func queryValue(path: String, sql: String) throws -> String? {
         if failing.contains(path) { throw SQLiteError.queryFailed("boom") }
+        // The scanners ask which message tables exist before building any query, so this answers first.
+        if sql.contains("sqlite_master") {
+            return tables[path] ?? "1|1"
+        }
         // OpenCode 2 credential-table lookups have their own payload bucket so the auth fallback
         // path is testable without mixing usage rows and credential rows.
         if sql.contains("FROM credential") {
