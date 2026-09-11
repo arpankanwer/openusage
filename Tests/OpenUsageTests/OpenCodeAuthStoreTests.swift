@@ -95,6 +95,28 @@ final class OpenCodeAuthStoreTests: XCTestCase {
         )
     }
 
+    func testCredentialFallbackQueriesAreScopedToOpenCodeIntegrations() {
+        // Both queries must name their integration — an unscoped LIKE 'sk-%' could hand goAPIKey()
+        // a BYO key to send as a Bearer token.
+        XCTAssertTrue(OpenCodeAuthStore.credentialSQLGoKey.contains("integration_id = 'opencode-go'"))
+        XCTAssertTrue(OpenCodeAuthStore.credentialSQLOpencodeKey.contains("integration_id = 'opencode'"))
+        XCTAssertFalse(OpenCodeAuthStore.credentialSQLOpencodeKey.contains("openai"))
+    }
+
+    func testCredentialDatabaseFailuresReturnNilInsteadOfThrowing() throws {
+        // A locked or unreadable database reads as "not stored there", never as a throw — the failure
+        // is logged and the scanner reports `databaseUnreadable` itself.
+        let store = OpenCodeAuthStore(
+            files: FakeFiles(),
+            environment: FakeEnvironment(["OPENCODE_DATA_DIR": "/oc"]),
+            homeDirectory: { URL(fileURLWithPath: "/nonexistent") },
+            sqlite: OpenCodeFakeSQLite(failing: ["/oc/opencode.db"]),
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+        XCTAssertNil(try store.goAPIKey())
+        XCTAssertFalse(try store.hasCodexOAuth())
+    }
+
     private func credentialStore(
         files: TextFileAccessing = FakeFiles(),
         credentials: [String: String]

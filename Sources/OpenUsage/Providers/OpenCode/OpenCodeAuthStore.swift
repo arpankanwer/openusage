@@ -15,15 +15,14 @@ struct OpenCodeAuthStore: Sendable {
     var sqlite: SQLiteAccessing
     var databasePaths: @Sendable () throws -> [String]
 
-    /// Credential lookups against the OpenCode 2 `credential` table. The Go key tries its own
-    /// integration first, then any `sk-` key as a last resort (mirrors the `opencode-go` → `opencode`
-    /// fallback in the issue workaround). The Codex lookup reads the whole `value` object because the
-    /// OAuth fields live beside `type`, not under a single key.
-    private static let credentialSQLGoKey =
+    /// OpenCode 2 `credential`-table lookups. The Go-key fallback tries `opencode-go`, then `opencode`
+    /// — scoped to those two IDs so a BYO key (e.g. OpenAI) can never be mistaken for Go auth and sent
+    /// to the usage endpoint as a Bearer token.
+    static let credentialSQLGoKey =
         "SELECT json_extract(value,'$.key') FROM credential WHERE integration_id = 'opencode-go' AND json_extract(value,'$.key') LIKE 'sk-%' LIMIT 1;"
-    private static let credentialSQLAnyKey =
-        "SELECT json_extract(value,'$.key') FROM credential WHERE json_extract(value,'$.key') LIKE 'sk-%' LIMIT 1;"
-    private static let credentialSQLCodexOAuth =
+    static let credentialSQLOpencodeKey =
+        "SELECT json_extract(value,'$.key') FROM credential WHERE integration_id = 'opencode' AND json_extract(value,'$.key') LIKE 'sk-%' LIMIT 1;"
+    static let credentialSQLCodexOAuth =
         "SELECT value FROM credential WHERE integration_id = 'openai' AND json_extract(value,'$.type') = 'oauth' LIMIT 1;"
 
     init(
@@ -71,7 +70,7 @@ struct OpenCodeAuthStore: Sendable {
            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
             return trimmed
         }
-        for sql in [Self.credentialSQLGoKey, Self.credentialSQLAnyKey] {
+        for sql in [Self.credentialSQLGoKey, Self.credentialSQLOpencodeKey] {
             if let key = credentialValue(from: sql) {
                 return key
             }
@@ -121,15 +120,15 @@ struct OpenCodeAuthStore: Sendable {
         return object
     }
 
-    /// Best-effort lookup in the `credential` table across all `opencode*.db` files. A missing table,
-    /// missing database, or unreadable data directory is treated as "not stored there" rather than an
-    /// error, so broken database access can't masquerade as a credential failure — the usage scanner
-    /// already surfaces `databaseUnreadable` for that.
+    /// Best-effort lookup across all `opencode*.db` files. Missing tables read as "not stored there";
+    /// anything else that fails is logged, since the Codex scanner exits at its auth guard and would
+    /// otherwise drop usage silently. Never throws — the Go path reports the scanner's `databaseUnreadable`.
     private func credentialValue(from sql: String) -> String? {
         let paths: [String]
         do {
             paths = try databasePaths()
         } catch {
+            AppLog.warn(LogTag.plugin("opencode"), "credential lookup skipped: data directory unreadable: \(error.localizedDescription)")
             return nil
         }
         for path in paths {
@@ -139,6 +138,9 @@ struct OpenCodeAuthStore: Sendable {
                     return value
                 }
             } catch {
+                // Pre-OpenCode-2 databases have no `credential` table — expected, not an error.
+                if error.localizedDescription.contains("no such table") { continue }
+                AppLog.warn(LogTag.plugin("opencode"), "credential lookup failed for \(path): \(error.localizedDescription)")
                 continue
             }
         }
