@@ -51,11 +51,22 @@ struct OpenCodeCodexUsageScanner: Sendable {
         let cutoffMs = Int(since.timeIntervalSince1970 * 1000)
         var rows: [Row] = []
         var failures: [String: String] = [:]
+        // Only databases with message tables vote on the empty-vs-missing decision below.
+        var usable: Set<String> = []
         for path in paths {
+            let tables: OpenCodeMessageTables
             do {
                 // A database with no message tables has nothing to contribute; skip it rather than let
                 // the query fail and drop every other database's rows.
-                guard let tables = try Self.messageTables(in: path, sqlite: sqlite) else { continue }
+                guard let probed = try Self.messageTables(in: path, sqlite: sqlite) else { continue }
+                tables = probed
+            } catch {
+                usable.insert(path)
+                failures[path] = error.localizedDescription
+                continue
+            }
+            usable.insert(path)
+            do {
                 if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs, tables: tables)) {
                     rows.append(contentsOf: Self.parseRows(json))
                 }
@@ -74,7 +85,7 @@ struct OpenCodeCodexUsageScanner: Sendable {
                 "Codex usage query failed for \(path): \(failures[path] ?? "unknown error")"
             )
         }
-        guard failures.count < paths.count else { return nil }
+        guard usable.isEmpty || failures.count < usable.count else { return nil }
 
         var accumulator = DailyUsageAccumulator()
         // Codex pricing depends only on the model slug, and resolving one walks every supplement alias

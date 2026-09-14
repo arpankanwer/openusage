@@ -185,6 +185,33 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         )
         XCTAssertFalse(scanner.hasHostedUsage())
     }
+
+    func testFailingUsableDatabaseStillThrowsWhenSchemaLessSiblingExists() async {
+        // The skipped file must not vote — the only usable database failed, so this must throw.
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(
+                failing: ["/oc/opencode-next.db"],
+                tables: ["/oc/opencode.db": "0|0", "/oc/opencode-next.db": "1|1"]
+            ),
+            databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
+        )
+        do {
+            _ = try await scanner.scan(now: now)
+            XCTFail("expected databaseUnreadable")
+        } catch {
+            XCTAssertEqual(error as? OpenCodeUsageError, .databaseUnreadable)
+        }
+    }
+
+    func testAllSchemaLessDatabasesYieldEmptyScanNotThrow() async throws {
+        // Nothing had usage to read — "No data", not an error.
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(tables: ["/oc/opencode.db": "0|0"]),
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+        guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
+        XCTAssertTrue(scan.logScan.series.daily.isEmpty)
+    }
 }
 
 /// One `[time_created, cost, tokens, model, provider]` row in the `json_group_array` shape both

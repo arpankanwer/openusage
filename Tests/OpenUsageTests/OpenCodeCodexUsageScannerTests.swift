@@ -248,6 +248,42 @@ final class OpenCodeCodexUsageScannerTests: XCTestCase {
         XCTAssertFalse(v2.contains("FROM message"), v2)
     }
 
+    func testFailingUsableDatabaseReturnsNilWhenSchemaLessSiblingExists() async {
+        // The skipped file must not vote — the only usable database failed, so no supplement.
+        let sqlite = OpenCodeFakeSQLite(
+            failing: ["/oc/opencode-next.db"],
+            tables: ["/oc/opencode.db": "0|0", "/oc/opencode-next.db": "1|1"]
+        )
+        let scanner = OpenCodeCodexUsageScanner(
+            authStore: OpenCodeAuthStore(
+                files: FakeFiles(["/oc/auth.json": #"{"openai":{"type":"oauth","access":"token"}}"#]),
+                environment: FakeEnvironment(["OPENCODE_DATA_DIR": "/oc"]),
+                homeDirectory: { URL(fileURLWithPath: "/unused") }
+            ),
+            sqlite: sqlite,
+            databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
+        )
+        let scan = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertNil(scan)
+    }
+
+    func testAllSchemaLessDatabasesYieldEmptySupplement() async {
+        // Nothing had usage to read — an empty supplement, not a missing one.
+        let sqlite = OpenCodeFakeSQLite(tables: ["/oc/opencode.db": "0|0"])
+        let scanner = OpenCodeCodexUsageScanner(
+            authStore: OpenCodeAuthStore(
+                files: FakeFiles(["/oc/auth.json": #"{"openai":{"type":"oauth","access":"token"}}"#]),
+                environment: FakeEnvironment(["OPENCODE_DATA_DIR": "/oc"]),
+                homeDirectory: { URL(fileURLWithPath: "/unused") }
+            ),
+            sqlite: sqlite,
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+        let scan = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertNotNil(scan)
+        XCTAssertTrue(scan?.series.daily.isEmpty ?? false)
+    }
+
     private func row(
         _ iso: String,
         cost: String,

@@ -73,11 +73,19 @@ struct OpenCodeUsageScanner: Sendable {
         var failures: [String: String] = [:]
 
         for path in paths {
+            let tables: OpenCodeMessageTables
+            do {
+                // Skip files with no message tables before counting the path, or one readable but
+                // table-less file would mask every real failure as an empty scan.
+                guard let probed = try messageTables(in: path) else { continue }
+                tables = probed
+            } catch {
+                checked.insert(path)
+                failures[path] = error.localizedDescription
+                continue
+            }
             checked.insert(path)
             do {
-                // A database with no message tables has no usage to read; skip it instead of letting
-                // the query fail and paint the whole provider as unreadable.
-                guard let tables = try messageTables(in: path) else { continue }
                 if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs, tables: tables)) {
                     rows.append(contentsOf: Self.parseRows(json))
                 }
@@ -92,7 +100,8 @@ struct OpenCodeUsageScanner: Sendable {
         for path in newlyFailing.sorted() {
             AppLog.warn(LogTag.plugin("opencode"), "usage query failed for \(path): \(failures[path] ?? "unknown error")")
         }
-        if failures.count == checked.count {
+        // Only databases with message tables vote; all-skipped is an empty scan, not an error.
+        if !checked.isEmpty && failures.count == checked.count {
             throw OpenCodeUsageError.databaseUnreadable
         }
 
