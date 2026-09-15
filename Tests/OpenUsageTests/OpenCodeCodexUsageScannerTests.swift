@@ -214,6 +214,64 @@ final class OpenCodeCodexUsageScannerTests: XCTestCase {
         XCTAssertTrue(sql.contains("session_message"), sql)
         XCTAssertTrue(sql.contains("type = 'assistant'"), sql)
         XCTAssertTrue(sql.contains("$.model.providerID"), sql)
+        // Compaction summaries complete via $.status, not the assistant markers.
+        XCTAssertTrue(sql.contains("type = 'compaction'"), sql)
+        XCTAssertTrue(sql.contains("json_extract(data,'$.status') = 'completed'"), sql)
+    }
+
+    func testCompletedCompactionIsAttributed() async throws {
+        // Same shape as any other OAuth row: a completed v2 compaction prices like assistant
+        // traffic. File-based OAuth carries no creation time, so no age bound applies here.
+        let rows = "[" + row(
+            "2026-07-12T10:00:00.000Z", cost: "0", total: 151000, model: "gpt-test",
+            input: 150000, cacheRead: 500, output: 400, reasoning: 100, id: "cmp-1", source: "v2"
+        ) + "]"
+        let scan = await scanner(
+            auth: #"{"openai":{"type":"oauth","access":"token"}}"#,
+            rows: rows
+        ).scan(now: now, pricing: pricing)
+        XCTAssertEqual(try XCTUnwrap(scan?.series.daily.first).totalTokens, 151000)
+    }
+
+    func testV2RowsOlderThanTheOAuthCredentialAreExcluded() async throws {
+        // Experimental 1.18.x builds recorded zero cost for paid API-key traffic too, so a v2 row
+        // older than the OAuth credential may be paid history rather than subscription usage. v1 rows
+        // priced paid traffic correctly and are unaffected by the bound.
+        let before = row(
+            "2026-07-10T10:00:00.000Z", cost: "0", total: 999, model: "gpt-test",
+            input: 900, cacheRead: 50, output: 40, reasoning: 9, id: "old-1", source: "v2"
+        )
+        let after = row(
+            "2026-07-12T10:00:00.000Z", cost: "0", total: 150, model: "gpt-test",
+            input: 100, cacheRead: 20, output: 20, reasoning: 10, id: "new-1", source: "v2"
+        )
+        let legacy = row(
+            "2026-07-10T09:00:00.000Z", cost: "0", total: 70, model: "gpt-test",
+            input: 60, cacheRead: 5, output: 4, reasoning: 1, id: "v1-1"
+        )
+        let credentialMs = Int(OpenUsageISO8601.date(from: "2026-07-11T12:00:00.000Z")!.timeIntervalSince1970 * 1000)
+        let sqlite = OpenCodeFakeSQLite(
+            data: ["/oc/opencode.db": "[" + [before, after, legacy].joined(separator: ",") + "]"],
+            credentials: ["/oc/opencode.db": #"{"type":"oauth","access":"a","refresh":"r"}"#],
+            credentialTimes: ["/oc/opencode.db": "\(credentialMs)"]
+        )
+        let scanner = OpenCodeCodexUsageScanner(
+            authStore: OpenCodeAuthStore(
+                files: FakeFiles(),
+                environment: FakeEnvironment(["OPENCODE_DATA_DIR": "/oc"]),
+                homeDirectory: { URL(fileURLWithPath: "/unused") },
+                sqlite: sqlite,
+                databasePaths: { ["/oc/opencode.db"] }
+            ),
+            sqlite: sqlite,
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+        let scan = await scanner.scan(now: now, pricing: pricing)
+        let byDay = Dictionary(
+            uniqueKeysWithValues: (scan?.series.daily ?? []).map { ($0.date, $0.totalTokens) }
+        )
+        XCTAssertEqual(byDay["2026-07-12"], 150)
+        XCTAssertEqual(byDay["2026-07-10"], 70)
     }
 
     func testV2OnlyDatabaseScansWithoutNamingTheMissingTable() async throws {
@@ -294,9 +352,13 @@ final class OpenCodeCodexUsageScannerTests: XCTestCase {
         cacheWrite: Int = 0,
         output: Int,
         reasoning: Int = 0,
-        id: String = "message-1"
+        id: String = "message-1",
+        source: String? = nil
     ) -> String {
         let milliseconds = Int(OpenUsageISO8601.date(from: iso)!.timeIntervalSince1970 * 1000)
-        return "[\(milliseconds),\(cost),\(total),\"\(model)\",\(input),\(cacheRead),\(cacheWrite),\(output),\(reasoning),\"\(id)\"]"
+        let base = "[\(milliseconds),\(cost),\(total),\"\(model)\",\(input),\(cacheRead),\(cacheWrite),\(output),\(reasoning),\"\(id)\""
+        // No marker decodes as v1, matching rows produced before the source column existed.
+        guard let source else { return base + "]" }
+        return base + ",\"\(source)\"]"
     }
 }

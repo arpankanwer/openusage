@@ -28,9 +28,11 @@ sends it as a Bearer token to the usage API. There's no login prompt and no toke
 
 OpenCode 1 stored the key in `auth.json` (`{"opencode-go":{"key":"sk-..."}}`); OpenCode 2 (beta)
 stores it in the SQLite `credential` table (`integration_id='opencode-go'`, `value` JSON
-`{"type":"key","key":"sk-..."}`). OpenUsage tries `auth.json` first, then falls back to the
-`credential` table so fresh installs after 2026 still get Go meters. Spend tiles still read the
-local SQLite logs in that same directory.
+`{"type":"key","key":"sk-..."}`). OpenUsage reads the live database first — OpenCode 2 imports the
+file without deleting it, so a retained file key goes stale after rotation while SQLite holds the
+current one — and keeps `auth.json` as the fallback for OpenCode 1. Within the table it takes the
+current row first (OpenCode keeps superseded rows as inactive), so a previous account's key can't
+stand in for the live one. Spend tiles still read the local SQLite logs in that same directory.
 
 When OpenCode uses its built-in ChatGPT Pro/Plus OAuth login, that usage belongs to the Codex
 subscription and appears in OpenUsage's **Codex** spend tiles and trend. It is not mixed into the
@@ -76,7 +78,12 @@ line is `opencode-next.db` — so all channels are unioned). OpenCode 1 logged t
 (`$.role`, `$.providerID`, `$.modelID`, `$.tokens.total`); OpenCode 2 logs to `session_message`
 (`type='assistant'`, `$.model.providerID`, `$.model.id`, `$.tokens.input/output/reasoning/cache.*`). The
 query unions both tables with coalesced JSON paths so either schema (or both during migration) works.
-Both `opencode-go` (Go) and `opencode` (Zen) count. Read-only.
+2.0.3 copies legacy rows into `session_message` under their original IDs, so copies are deduplicated
+by ID across tables and channel databases rather than counted twice. Completed compaction summaries
+(`type='compaction'`) count too. Both `opencode-go` (Go) and `opencode` (Zen) count. Read-only.
+
+If the Go meters request fails (network, server, rejected key), the local tiles still show — the
+failure is logged and only surfaces as an error when there is nothing else to display.
 
 The Codex attribution scan reads the same unioned pair for its `openai` rows, so OAuth usage recorded
 after an OpenCode 2 upgrade is counted there too.

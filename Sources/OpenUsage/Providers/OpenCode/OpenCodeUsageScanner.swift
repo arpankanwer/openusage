@@ -106,7 +106,9 @@ struct OpenCodeUsageScanner: Sendable {
         }
 
         var accumulator = DailyUsageAccumulator()
-        for row in rows {
+        // OpenCode 2.0.3 copies legacy rows into `session_message` under their original IDs, so the
+        // union holds both copies. Deduplicate before accumulating, across tables and channel databases.
+        for row in Self.deduplicated(rows) {
             let date = Date(timeIntervalSince1970: row.ms / 1000)
             guard date >= tileSince else { continue }
             accumulator.add(
@@ -158,11 +160,12 @@ struct OpenCodeUsageScanner: Sendable {
         var cost: Double
         var tokens: Int
         var model: String
+        var id: String?
     }
 
     /// Parse the `json_group_array(json_array(...))` payload: an array of
-    /// `[time_created, cost, tokensTotal, modelID, providerID]`. Rows with a missing timestamp/cost or a
-    /// non-string providerID are skipped at this boundary.
+    /// `[time_created, cost, tokensTotal, modelID, providerID, id?]`. Rows with a missing
+    /// timestamp/cost or a non-string providerID are skipped at this boundary.
     private static func parseRows(_ json: String) -> [Row] {
         guard let data = json.data(using: .utf8),
               let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
@@ -180,9 +183,33 @@ struct OpenCodeUsageScanner: Sendable {
             // (Int(Double) crashes above Int.max). 1e15 is far above any real token total.
             let tokens = Int(min(max(ProviderParse.number(entry[2]) ?? 0, 0), 1e15))
             let model = (entry[3] as? String) ?? ""
-            rows.append(Row(ms: ms, cost: cost, tokens: tokens, model: model))
+            let id = (entry.count >= 6 ? entry[5] as? String : nil)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            rows.append(Row(ms: ms, cost: cost, tokens: tokens, model: model, id: id))
         }
         return rows
+    }
+
+    /// Migrated and channel-copied rows share their original ID; keep one copy, preferring the later
+    /// timestamp and then the larger token count. Rows without an ID stay independent.
+    private static func deduplicated(_ rows: [Row]) -> [Row] {
+        var withoutID: [Row] = []
+        var byID: [String: Row] = [:]
+        for row in rows {
+            guard let id = row.id else {
+                withoutID.append(row)
+                continue
+            }
+            guard let existing = byID[id] else {
+                byID[id] = row
+                continue
+            }
+            if row.ms > existing.ms ||
+                (row.ms == existing.ms && row.tokens > existing.tokens) {
+                byID[id] = row
+            }
+        }
+        return withoutID + byID.values
     }
 
     // MARK: - SQL
@@ -207,7 +234,8 @@ struct OpenCodeUsageScanner: Sendable {
                  json_extract(data,'$.cost'),
                  COALESCE(json_extract(data,'$.tokens.total'), COALESCE(json_extract(data,'$.tokens.input'),0)+COALESCE(json_extract(data,'$.tokens.output'),0)+COALESCE(json_extract(data,'$.tokens.reasoning'),0)+COALESCE(json_extract(data,'$.tokens.cache.read'),0)+COALESCE(json_extract(data,'$.tokens.cache.write'),0)),
                  COALESCE(json_extract(data,'$.model.id'), json_extract(data,'$.modelID')),
-                 COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID'))))
+                 COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')),
+                 id))
         FROM
         """
 
@@ -230,6 +258,8 @@ struct OpenCodeUsageScanner: Sendable {
 
     /// `message` names the role and provider flatly; `session_message` moved the role into its `type`
     /// column and namespaced the model under `$.model`, so each branch is filtered for its own schema.
+    /// Compaction summaries exist only on the v2 table and complete via `$.status`, not the assistant
+    /// markers, so they carry their own condition.
     private static func v1Rows(cutoffMs: Int) -> String {
         """
         SELECT time_created, data FROM message
@@ -245,10 +275,11 @@ struct OpenCodeUsageScanner: Sendable {
         """
         SELECT time_created, data FROM session_message
         WHERE time_created >= \(cutoffMs)
-          AND type = 'assistant'
           AND json_valid(data)
           AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
           AND json_type(data,'$.cost') IN ('integer','real')
+          AND (type = 'assistant'
+               OR (type = 'compaction' AND json_extract(data,'$.status') = 'completed'))
         """
     }
 
@@ -262,9 +293,10 @@ struct OpenCodeUsageScanner: Sendable {
 
     private static let v2Probe = """
         SELECT 1 FROM session_message
-        WHERE type = 'assistant'
-          AND json_valid(data)
+        WHERE json_valid(data)
           AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) IN \(providerFilter)
           AND json_type(data,'$.cost') IN ('integer','real')
+          AND (type = 'assistant'
+               OR (type = 'compaction' AND json_extract(data,'$.status') = 'completed'))
         """
 }

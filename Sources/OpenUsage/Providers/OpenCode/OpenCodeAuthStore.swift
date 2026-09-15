@@ -15,15 +15,18 @@ struct OpenCodeAuthStore: Sendable {
     var sqlite: SQLiteAccessing
     var databasePaths: @Sendable () throws -> [String]
 
-    /// OpenCode 2 `credential`-table lookups. The Go-key fallback tries `opencode-go`, then `opencode`
-    /// — scoped to those two IDs so a BYO key (e.g. OpenAI) can never be mistaken for Go auth and sent
-    /// to the usage endpoint as a Bearer token.
+    /// OpenCode 2 `credential` lookups, current row first: superseded rows stay in the table, so an
+    /// unordered `LIMIT 1` can return a previous account. Ordering mirrors OpenCode (`active DESC,
+    /// time_updated DESC, id DESC`); the filter admits NULL-flagged imports. Go keys stay scoped to
+    /// `opencode-go`/`opencode` so a BYO key is never sent as a Bearer token.
     static let credentialSQLGoKey =
-        "SELECT json_extract(value,'$.key') FROM credential WHERE integration_id = 'opencode-go' AND json_extract(value,'$.key') LIKE 'sk-%' LIMIT 1;"
+        "SELECT json_extract(value,'$.key') FROM credential WHERE integration_id = 'opencode-go' AND (active IS NULL OR active = 1) AND json_extract(value,'$.key') LIKE 'sk-%' ORDER BY active DESC, time_updated DESC, id DESC LIMIT 1;"
     static let credentialSQLOpencodeKey =
-        "SELECT json_extract(value,'$.key') FROM credential WHERE integration_id = 'opencode' AND json_extract(value,'$.key') LIKE 'sk-%' LIMIT 1;"
-    static let credentialSQLCodexOAuth =
-        "SELECT value FROM credential WHERE integration_id = 'openai' AND json_extract(value,'$.type') = 'oauth' LIMIT 1;"
+        "SELECT json_extract(value,'$.key') FROM credential WHERE integration_id = 'opencode' AND (active IS NULL OR active = 1) AND json_extract(value,'$.key') LIKE 'sk-%' ORDER BY active DESC, time_updated DESC, id DESC LIMIT 1;"
+    static let credentialSQLCurrentOpenAI =
+        "SELECT value FROM credential WHERE integration_id = 'openai' AND (active IS NULL OR active = 1) ORDER BY active DESC, time_updated DESC, id DESC LIMIT 1;"
+    static let credentialSQLCurrentOpenAITime =
+        "SELECT time_created FROM credential WHERE integration_id = 'openai' AND (active IS NULL OR active = 1) ORDER BY active DESC, time_updated DESC, id DESC LIMIT 1;"
 
     init(
         files: TextFileAccessing = LocalTextFileAccessor(),
@@ -56,26 +59,49 @@ struct OpenCodeAuthStore: Sendable {
         OpenCodePaths.authFilePath(dataDirectory: dataDirectory)
     }
 
-    /// The non-empty `opencode-go` API key, or `nil` when the user has not logged into OpenCode Go.
-    /// Reads `auth.json` first (OpenCode 1), then falls back to the SQLite `credential` table
-    /// (OpenCode 2, `integration_id='opencode-go'` with `value` JSON `{"type":"key","key":"sk-..."}`).
-    /// Reads only that one entry — tolerant of unrelated sibling entries (other providers, or a future
-    /// non-object field like a schema marker) so one odd value can't hide a valid key. A present file
-    /// that can't be read or parsed throws `credentialsUnreadable` so broken storage is never mistaken
-    /// for logout; an absent file, or a file without the entry, falls through to the database.
+    /// The non-empty `opencode-go` API key, or `nil` when not logged into Go. The live database
+    /// wins: OpenCode 2 imports `auth.json` without deleting it, so a retained file key goes stale
+    /// while SQLite holds the current one; the file remains the OpenCode 1 fallback. Unreadable
+    /// files throw `credentialsUnreadable` rather than reading as logout.
     func goAPIKey() throws -> String? {
+        for sql in [Self.credentialSQLGoKey, Self.credentialSQLOpencodeKey] {
+            if let key = credentialValue(from: sql) {
+                return key
+            }
+        }
         if let object = try authObject(),
            let entry = object["opencode-go"] as? [String: Any],
            let key = entry["key"] as? String,
            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
             return trimmed
         }
-        for sql in [Self.credentialSQLGoKey, Self.credentialSQLOpencodeKey] {
-            if let key = credentialValue(from: sql) {
-                return key
-            }
-        }
         return nil
+    }
+
+    /// The current `openai` credential: whether it is ChatGPT/Codex OAuth, and when its row was
+    /// created (`nil` for file-based credentials, which carry no timestamp).
+    struct OpenAICredential: Sendable {
+        var isOAuth: Bool
+        var since: Date?
+    }
+
+    /// The current `openai` credential, database first for the same staleness reason. The row is
+    /// chosen before its type is checked — OAuth-first filtering would resurrect an inactive account
+    /// while the live credential is an API key.
+    func openAICredential() throws -> OpenAICredential {
+        if let value = credentialValue(from: Self.credentialSQLCurrentOpenAI),
+           let data = value.data(using: .utf8),
+           let entry = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            var since: Date?
+            if let ms = credentialValue(from: Self.credentialSQLCurrentOpenAITime).flatMap(Double.init) {
+                since = Date(timeIntervalSince1970: ms / 1000)
+            }
+            return OpenAICredential(isOAuth: Self.isCodexOAuth(entry), since: since)
+        }
+        if let entry = try authObject()?["openai"] as? [String: Any] {
+            return OpenAICredential(isOAuth: Self.isCodexOAuth(entry), since: nil)
+        }
+        return OpenAICredential(isOAuth: false, since: nil)
     }
 
     /// Whether OpenCode's `openai` provider is currently authenticated through the built-in ChatGPT /
@@ -83,14 +109,7 @@ struct OpenCodeAuthStore: Sendable {
     /// checking the auth type is required before attributing its `providerID = openai` database rows to
     /// the Codex card. Secrets stay inside the auth boundary and are never returned or logged.
     func hasCodexOAuth() throws -> Bool {
-        if let entry = try authObject()?["openai"] as? [String: Any], Self.isCodexOAuth(entry) {
-            return true
-        }
-        guard let value = credentialValue(from: Self.credentialSQLCodexOAuth),
-              let data = value.data(using: .utf8),
-              let entry = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return false }
-        return Self.isCodexOAuth(entry)
+        try openAICredential().isOAuth
     }
 
     /// One OAuth entry is enough — OpenCode writes both fields, but a refresh-only or access-only row

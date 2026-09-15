@@ -31,8 +31,15 @@ struct OpenCodeCodexUsageScanner: Sendable {
     /// Best-effort supplementary scan: failures are logged loudly but never hide Codex's live quota
     /// meters or native history. This matches pi's role as an optional local source.
     func scan(now: Date, daysBack: Int = 30, pricing: ModelPricing) async -> LogUsageScan? {
+        // Zero cost alone doesn't prove subscription usage: experimental 1.18.x builds recorded zero
+        // cost for every request, including paid API-key traffic. v2 rows older than the OAuth
+        // credential may be that paid history, so they are attributed only from the credential's
+        // creation on. v1 rows priced paid traffic correctly and need no such bound.
+        let oauthSince: Date?
         do {
-            guard try authStore.hasCodexOAuth() else { return nil }
+            let oauth = try authStore.openAICredential()
+            guard oauth.isOAuth else { return nil }
+            oauthSince = oauth.since
         } catch {
             AppLog.warn(LogTag.plugin("opencode"), "Codex OAuth attribution skipped: \(error.localizedDescription)")
             return nil
@@ -91,7 +98,8 @@ struct OpenCodeCodexUsageScanner: Sendable {
         // Codex pricing depends only on the model slug, and resolving one walks every supplement alias
         // rule. Real histories run to thousands of rows across a handful of models, so resolve once each.
         var preparedByModel: [String: CodexUsagePricing.Prepared?] = [:]
-        for row in Self.deduplicated(rows) where row.timestamp >= since {
+        for row in Self.deduplicated(rows)
+            where row.timestamp >= since && (row.source != "v2" || oauthSince.map({ row.timestamp >= $0 }) ?? true) {
             let day = DailyUsageAccumulator.dayKey(from: row.timestamp)
             guard let model = row.model.nilIfEmpty else { continue }
             let prepared: CodexUsagePricing.Prepared?
@@ -125,14 +133,19 @@ struct OpenCodeCodexUsageScanner: Sendable {
         return tables.isEmpty ? nil : tables
     }
 
-    struct Row: Sendable, Equatable {        var id: String?
+    struct Row: Sendable, Equatable {
+        var id: String?
         var timestamp: Date
         var model: String
         var tokens: TokenBreakdown
         var reportedTotalTokens: Int
+        /// Which table the row came from. v2 rows are bound to the OAuth credential's age; v1 rows
+        /// priced paid traffic correctly and are not.
+        var source: String = "v1"
     }
 
-    /// Decodes `[completedAt, cost, total, model, input, cacheRead, cacheWrite, output, reasoning, id]`.
+    /// Decodes `[completedAt, cost, total, model, input, cacheRead, cacheWrite, output, reasoning,
+    /// id, source?]`. Older fixtures without the source marker decode as v1.
     static func parseRows(_ json: String) -> [Row] {
         guard let data = json.data(using: .utf8),
               let payload = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
@@ -163,7 +176,8 @@ struct OpenCodeCodexUsageScanner: Sendable {
                 model: ((values[3] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
                 tokens: tokens,
                 // OpenCode's own total is only a fallback: the parsed buckets are what gets priced.
-                reportedTotalTokens: tokens.totalTokens > 0 ? tokens.totalTokens : clampedTokens(values[2])
+                reportedTotalTokens: tokens.totalTokens > 0 ? tokens.totalTokens : clampedTokens(values[2]),
+                source: (values.count >= 11 ? values[10] as? String : nil) ?? "v1"
             )
         }
     }
@@ -194,8 +208,8 @@ struct OpenCodeCodexUsageScanner: Sendable {
         Int(min(max(ProviderParse.number(value) ?? 0, 0), 1_000_000_000_000_000))
     }
 
-    /// Ten columns in `parseRows` order, written once so the table combinations can't drift. Only
-    /// `time_created`, `id`, and `data` are unioned; the projection sits outside.
+    /// Ten usage columns plus the source table, in `parseRows` order. The projection sits outside
+    /// the union so the table combinations can't drift; each branch tags its own rows.
     private static let dataProjection = """
         SELECT json_group_array(json_array(
                  COALESCE(json_extract(data,'$.time.completed'),time_created),
@@ -207,17 +221,19 @@ struct OpenCodeCodexUsageScanner: Sendable {
                  COALESCE(json_extract(data,'$.tokens.cache.write'),0),
                  COALESCE(json_extract(data,'$.tokens.output'),0),
                  COALESCE(json_extract(data,'$.tokens.reasoning'),0),
-                 id))
+                 id,
+                 source))
         FROM
         """
 
     /// OpenCode recorded OAuth Codex traffic as `providerID = 'openai'` on the v1 table and
     /// `$.model.providerID` on the v2 one, and moved the role from `$.role` into the `type` column.
     /// Both branches keep the zero-cost filter: the built-in Codex OAuth plugin writes every model rate
-    /// as zero, so a positive cost is API-key traffic that must stay off the Codex card.
+    /// as zero, so a positive cost is API-key traffic that must stay off the Codex card. Compaction
+    /// summaries complete via `$.status`, not the assistant markers, so they carry their own condition.
     private static func v1Rows(cutoffMs: Int, creationCutoffMs: Int) -> String {
         """
-        SELECT time_created, id, data FROM message
+        SELECT time_created, id, data, 'v1' AS source FROM message
         WHERE time_created >= \(creationCutoffMs)
           AND json_valid(data)
           AND json_extract(data,'$.role') = 'assistant'
@@ -231,15 +247,16 @@ struct OpenCodeCodexUsageScanner: Sendable {
 
     private static func v2Rows(cutoffMs: Int, creationCutoffMs: Int) -> String {
         """
-        SELECT time_created, id, data FROM session_message
+        SELECT time_created, id, data, 'v2' AS source FROM session_message
         WHERE time_created >= \(creationCutoffMs)
-          AND type = 'assistant'
           AND json_valid(data)
           AND COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) = 'openai'
           AND json_type(data,'$.cost') IN ('integer','real')
           AND json_extract(data,'$.cost') = 0
-          AND (json_type(data,'$.time.completed') IN ('integer','real')
-               OR json_type(data,'$.finish') = 'text')
+          AND ((type = 'assistant'
+                AND (json_type(data,'$.time.completed') IN ('integer','real')
+                     OR json_type(data,'$.finish') = 'text'))
+               OR (type = 'compaction' AND json_extract(data,'$.status') = 'completed'))
         """
     }
 
